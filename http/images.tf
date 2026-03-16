@@ -1,5 +1,5 @@
 resource "openstack_images_image_v2" "noble" {
-  name             = "ubuntu-noble"
+  name             = "ubuntu-noble-x86_64"
   image_source_url = "http://100.70.135.32:8080/noble-server-cloudimg-amd64.img"
   container_format = "bare"
   disk_format      = "qcow2"
