@@ -137,22 +137,21 @@ deploy_base_infrastructure() {
 
     # Check current state
     log "Checking current infrastructure state..."
-    if tofu plan -var-file tfvars/vars-all.tfvars -detailed-exitcode >/dev/null 2>&1; then
-        exit_code=$?
-        case $exit_code in
-            0)
-                log "Infrastructure is up to date, no changes needed"
-                return 0
-                ;;
-            1)
-                log_error "Terraform plan failed"
-                return 1
-                ;;
-            2)
-                log "Changes detected, applying infrastructure updates..."
-                ;;
-        esac
-    fi
+    tofu plan -var-file tfvars/vars-all.tfvars -detailed-exitcode >/dev/null 2>&1
+    plan_exit=$?
+    case $plan_exit in
+        0)
+            log "Infrastructure is up to date, no changes needed"
+            return 0
+            ;;
+        1)
+            log_error "Terraform plan failed"
+            return 1
+            ;;
+        2)
+            log "Changes detected, applying infrastructure updates..."
+            ;;
+    esac
 
     # Apply Terraform configuration
     log "Applying base infrastructure (this may take 15-30 minutes)..."
@@ -269,6 +268,50 @@ setup_head_services_variables() {
     log_success "Head services variables setup completed"
 }
 
+# Wait for Helm/Kubernetes dependencies before deploying head
+wait_for_head_dependencies() {
+    log "Waiting for head service dependencies to be ready..."
+
+    # cert-manager
+    log "Waiting for cert-manager..."
+    if ! kubectl wait deployment/cert-manager \
+            -n cert-manager --for=condition=Available \
+            --timeout=300s 2>/dev/null; then
+        log_warning "cert-manager not found or not ready, continuing..."
+    else
+        kubectl wait deployment/cert-manager-webhook \
+            -n cert-manager --for=condition=Available \
+            --timeout=120s 2>/dev/null || true
+        log_success "cert-manager ready"
+    fi
+
+    # keycloak-operator
+    log "Waiting for keycloak-operator..."
+    if ! kubectl wait deployment/keycloak-operator \
+            -n keycloak-operator --for=condition=Available \
+            --timeout=300s 2>/dev/null; then
+        log_warning "keycloak-operator not found or not ready, continuing..."
+    else
+        log_success "keycloak-operator ready"
+    fi
+
+    # cnpg / postgres operator
+    log "Waiting for cnpg controller..."
+    if ! kubectl wait deployment/cnpg-controller-manager \
+            -n cnpg-system --for=condition=Available \
+            --timeout=300s 2>/dev/null; then
+        log_warning "cnpg-controller-manager not found or not ready, continuing..."
+    else
+        log_success "cnpg controller ready"
+    fi
+
+    # Extra buffer so webhooks/CRDs are fully registered
+    log "Sleeping 30s for webhook/CRD registration..."
+    sleep 30
+
+    log_success "Dependency wait completed"
+}
+
 # Deploy head services
 deploy_head_services() {
     log "Deploying head services..."
@@ -353,29 +396,36 @@ EOF
         retry tofu init -upgrade
     fi
 
+    # Wait for dependencies before applying
+    wait_for_head_dependencies
+
     # Check current state before applying
     log "Checking current head services state..."
-    if tofu plan -detailed-exitcode >/dev/null 2>&1; then
-        exit_code=$?
-        case $exit_code in
-            0)
-                log "Head services are up to date, no changes needed"
-                return 0
-                ;;
-            1)
-                log_error "Terraform plan failed"
-                return 1
-                ;;
-            2)
-                log "Changes detected, applying head services updates..."
-                ;;
-        esac
-    fi
+    tofu plan -detailed-exitcode >/dev/null 2>&1
+    plan_exit=$?
+    case $plan_exit in
+        0)
+            log "Head services are up to date, no changes needed"
+            return 0
+            ;;
+        1)
+            log_error "Terraform plan failed"
+            return 1
+            ;;
+        2)
+            log "Changes detected, applying head services updates..."
+            ;;
+    esac
 
-    # Apply head services configuration
+    # Apply head services configuration with increased timeout via env var
     log "Applying head services configuration (this may take 20-40 minutes)..."
+    export HELM_TIMEOUT="${HELM_TIMEOUT:-900}"
     if ! retry tofu apply -auto-approve; then
-        log_error "Head services deployment failed"
+        log_error "Head services deployment failed after all retries"
+        log_error "Run the following to diagnose:"
+        log_error "  kubectl get pods -n crczp"
+        log_error "  kubectl get events -n crczp --sort-by=.lastTimestamp | tail -30"
+        log_error "  kubectl logs -n crczp -l app.kubernetes.io/name=keycloak --tail=50"
         return 1
     fi
 
@@ -392,13 +442,13 @@ main() {
     fi
 
     # Execute deployment steps
-    setup_application_credentials
-    setup_git_repository
-    deploy_base_infrastructure
-    setup_kubernetes_config
-    wait_for_kubernetes
-    setup_head_services_variables
-    deploy_head_services
+    setup_application_credentials || { log_error "setup_application_credentials failed"; exit 1; }
+    setup_git_repository || { log_error "setup_git_repository failed"; exit 1; }
+    deploy_base_infrastructure || { log_error "deploy_base_infrastructure failed"; exit 1; }
+    setup_kubernetes_config || { log_error "setup_kubernetes_config failed"; exit 1; }
+    wait_for_kubernetes || { log_error "wait_for_kubernetes failed"; exit 1; }
+    setup_head_services_variables || { log_error "setup_head_services_variables failed"; exit 1; }
+    deploy_head_services || { log_error "deploy_head_services failed"; exit 1; }
 
     log_success "=== Infrastructure Deployment Phase Completed ==="
 }
