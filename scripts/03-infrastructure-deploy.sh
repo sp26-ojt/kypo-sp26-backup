@@ -270,24 +270,24 @@ setup_head_services_variables() {
 
 # Clean up stuck/failed Helm releases so tofu apply can retry cleanly
 cleanup_failed_helm_releases() {
-    log "Checking for stuck Helm releases..."
+    log "Checking for stuck Helm releases across all namespaces..."
 
-    # Namespaces where head chart installs releases
-    local namespaces=("crczp" "cert-manager" "keycloak-operator" "cnpg-system" "monitoring")
+    # Get all releases in any non-deployed state
+    local stuck
+    stuck=$(helm list -A -o json 2>/dev/null \
+        | jq -r '.[] | select(.status != "deployed") | "\(.namespace) \(.name)"' 2>/dev/null || true)
 
-    for ns in "${namespaces[@]}"; do
-        # List releases in failed or pending-install state
-        local stuck
-        stuck=$(helm list -n "$ns" --filter '.*' -o json 2>/dev/null \
-            | jq -r '.[] | select(.status == "failed" or .status == "pending-install" or .status == "pending-upgrade") | .name' 2>/dev/null || true)
+    if [ -z "$stuck" ]; then
+        log "No stuck Helm releases found"
+        return 0
+    fi
 
-        if [ -n "$stuck" ]; then
-            while IFS= read -r release; do
-                log_warning "Uninstalling stuck release '$release' in namespace '$ns'..."
-                helm uninstall "$release" -n "$ns" --wait 2>/dev/null || true
-            done <<< "$stuck"
-        fi
-    done
+    while IFS=' ' read -r ns release; do
+        [ -z "$release" ] && continue
+        log_warning "Uninstalling stuck release '$release' in namespace '$ns' ..."
+        helm uninstall "$release" -n "$ns" --wait --timeout 120s 2>/dev/null || \
+            helm uninstall "$release" -n "$ns" --no-hooks 2>/dev/null || true
+    done <<< "$stuck"
 
     log_success "Helm cleanup done"
 }
@@ -423,6 +423,25 @@ EOF
     # Wait for dependencies before applying
     cleanup_failed_helm_releases
     wait_for_head_dependencies
+
+    # Also remove any helm_release resources from tofu state that correspond
+    # to stuck Helm releases, so tofu treats them as fresh installs
+    log "Syncing Terraform state with actual Helm state..."
+    local helm_state_resources
+    helm_state_resources=$(tofu state list 2>/dev/null | grep 'helm_release' || true)
+    if [ -n "$helm_state_resources" ]; then
+        while IFS= read -r res; do
+            local rel_name
+            rel_name=$(echo "$res" | sed 's/.*\.//')
+            local status
+            status=$(helm list -A -o json 2>/dev/null \
+                | jq -r --arg n "$rel_name" '.[] | select(.name == $n) | .status' 2>/dev/null | head -1)
+            if [ -z "$status" ] || [ "$status" != "deployed" ]; then
+                log_warning "State rm: $res (helm status: '${status:-not found}')"
+                tofu state rm "$res" 2>/dev/null || true
+            fi
+        done <<< "$helm_state_resources"
+    fi
 
     # Check current state before applying
     log "Checking current head services state..."
