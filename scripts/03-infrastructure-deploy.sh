@@ -20,6 +20,17 @@ BASE_TF_PATH="$REPO_PATH/tf-openstack-base"
 HEAD_TF_PATH="$REPO_PATH/tf-head-services"
 VENV_PATH="/root/kolla-ansible-venv"
 
+# === CUSTOM: Docker images của bạn ===
+CUSTOM_FRONTEND_IMAGE="sp26ojt/frontend-platform"
+CUSTOM_FRONTEND_TAG="v6"
+
+CUSTOM_TRAINING_IMAGE="nnm311/kypo-training-service"
+CUSTOM_TRAINING_TAG="v26"
+
+CUSTOM_ADAPTIVE_TRAINING_IMAGE="nnm311/kypo-adaptive-training-service"
+CUSTOM_ADAPTIVE_TRAINING_TAG="v1"
+# ======================================
+
 # Setup application credentials
 setup_application_credentials() {
     log "Setting up OpenStack application credentials..."
@@ -145,7 +156,7 @@ deploy_base_infrastructure() {
 
     # Apply Terraform configuration
     log "Applying base infrastructure (this may take 15-30 minutes)..."
-    
+
     # === CUSTOM FIX 2: Ép chạy tuần tự để chống nghẽn I/O ===
     if ! retry tofu apply -auto-approve -var-file tfvars/vars-all.tfvars -parallelism=1; then
         log_error "Base infrastructure deployment failed"
@@ -154,6 +165,7 @@ deploy_base_infrastructure() {
 
     log_success "Base infrastructure deployment completed"
 }
+
 # Setup Kubernetes configuration
 setup_kubernetes_config() {
     log "Setting up Kubernetes configuration..."
@@ -299,6 +311,38 @@ deploy_head_services() {
     else
         log_warning "values.yaml not found, continuing without DNS updates"
     fi
+
+    # === CUSTOM FIX: Override frontend, training, adaptive-training images ===
+    if [ -f values.yaml ]; then
+        if ! grep -q "CUSTOM_IMAGE_OVERRIDE" values.yaml; then
+            log "Appending custom image overrides to values.yaml..."
+            cat >> values.yaml << EOF
+
+# CUSTOM_IMAGE_OVERRIDE
+frontend:
+  image:
+    url: ${CUSTOM_FRONTEND_IMAGE}
+    tag: ${CUSTOM_FRONTEND_TAG}
+
+training:
+  image:
+    url: ${CUSTOM_TRAINING_IMAGE}
+    tag: ${CUSTOM_TRAINING_TAG}
+
+adaptive-training:
+  image:
+    url: ${CUSTOM_ADAPTIVE_TRAINING_IMAGE}
+    tag: ${CUSTOM_ADAPTIVE_TRAINING_TAG}
+EOF
+            log "Image overrides applied:"
+            log "  - frontend: ${CUSTOM_FRONTEND_IMAGE}:${CUSTOM_FRONTEND_TAG}"
+            log "  - training: ${CUSTOM_TRAINING_IMAGE}:${CUSTOM_TRAINING_TAG}"
+            log "  - adaptive-training: ${CUSTOM_ADAPTIVE_TRAINING_IMAGE}:${CUSTOM_ADAPTIVE_TRAINING_TAG}"
+        else
+            log "Custom image overrides already applied in values.yaml"
+        fi
+    fi
+    # =========================================================================
 
     # Check if Terraform is already initialized
     if [ ! -d ".terraform" ]; then
