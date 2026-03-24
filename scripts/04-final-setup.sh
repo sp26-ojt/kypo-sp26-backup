@@ -46,6 +46,12 @@ display_deployment_info() {
         keycloak_password="<unavailable>"
     fi
 
+    # Abort banner if head services state is clearly broken
+    if [ "$monitoring_password" = "<unavailable>" ] && [ "$keycloak_password" = "<unavailable>" ]; then
+        log_error "Head services outputs unavailable — deployment likely failed. Skipping success banner."
+        return 1
+    fi
+
     log_success "Deployment information gathered"
 
     # Display the information
@@ -139,7 +145,7 @@ main() {
     sleep 10
 
     verify_services
-    display_deployment_info
+    display_deployment_info || { log_error "Deployment did not complete successfully. Check logs above."; exit 1; }
     final_cleanup
 
     log_success "=== Final Setup Phase Completed ==="
