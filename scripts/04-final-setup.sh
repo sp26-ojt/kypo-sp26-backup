@@ -47,8 +47,11 @@ display_deployment_info() {
     fi
 
     # Abort banner if head services state is clearly broken
-    if [ "$monitoring_password" = "<unavailable>" ] && [ "$keycloak_password" = "<unavailable>" ]; then
-        log_error "Head services outputs unavailable — deployment likely failed. Skipping success banner."
+    # Check tofu state directly — if no resources exist, deploy failed
+    local head_resource_count
+    head_resource_count=$(tofu state list 2>/dev/null | wc -l || echo "0")
+    if [ "$head_resource_count" -lt 5 ]; then
+        log_error "Head services Terraform state has fewer than 5 resources (got $head_resource_count) — deployment likely failed. Skipping success banner."
         return 1
     fi
 
