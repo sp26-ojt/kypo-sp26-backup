@@ -268,6 +268,30 @@ setup_head_services_variables() {
     log_success "Head services variables setup completed"
 }
 
+# Clean up stuck/failed Helm releases so tofu apply can retry cleanly
+cleanup_failed_helm_releases() {
+    log "Checking for stuck Helm releases..."
+
+    # Namespaces where head chart installs releases
+    local namespaces=("crczp" "cert-manager" "keycloak-operator" "cnpg-system" "monitoring")
+
+    for ns in "${namespaces[@]}"; do
+        # List releases in failed or pending-install state
+        local stuck
+        stuck=$(helm list -n "$ns" --filter '.*' -o json 2>/dev/null \
+            | jq -r '.[] | select(.status == "failed" or .status == "pending-install" or .status == "pending-upgrade") | .name' 2>/dev/null || true)
+
+        if [ -n "$stuck" ]; then
+            while IFS= read -r release; do
+                log_warning "Uninstalling stuck release '$release' in namespace '$ns'..."
+                helm uninstall "$release" -n "$ns" --wait 2>/dev/null || true
+            done <<< "$stuck"
+        fi
+    done
+
+    log_success "Helm cleanup done"
+}
+
 # Wait for Helm/Kubernetes dependencies before deploying head
 wait_for_head_dependencies() {
     log "Waiting for head service dependencies to be ready..."
@@ -397,6 +421,7 @@ EOF
     fi
 
     # Wait for dependencies before applying
+    cleanup_failed_helm_releases
     wait_for_head_dependencies
 
     # Check current state before applying
@@ -417,19 +442,30 @@ EOF
             ;;
     esac
 
-    # Apply head services configuration with increased timeout via env var
+    # Apply with retry — cleanup stuck Helm releases between attempts
     log "Applying head services configuration (this may take 20-40 minutes)..."
-    export HELM_TIMEOUT="${HELM_TIMEOUT:-900}"
-    if ! retry tofu apply -auto-approve; then
-        log_error "Head services deployment failed after all retries"
-        log_error "Run the following to diagnose:"
-        log_error "  kubectl get pods -n crczp"
-        log_error "  kubectl get events -n crczp --sort-by=.lastTimestamp | tail -30"
-        log_error "  kubectl logs -n crczp -l app.kubernetes.io/name=keycloak --tail=50"
-        return 1
-    fi
+    local max_attempts=3
+    local attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        if tofu apply -auto-approve; then
+            log_success "Head services deployment completed"
+            return 0
+        fi
+        log_warning "tofu apply attempt $attempt/$max_attempts failed"
+        if [ $attempt -lt $max_attempts ]; then
+            log "Cleaning up stuck Helm releases before retry..."
+            cleanup_failed_helm_releases
+            sleep 15
+        fi
+        ((attempt++))
+    done
 
-    log_success "Head services deployment completed"
+    log_error "Head services deployment failed after $max_attempts attempts"
+    log_error "Run the following to diagnose:"
+    log_error "  kubectl get pods -n crczp"
+    log_error "  kubectl get events -n crczp --sort-by=.lastTimestamp | tail -30"
+    log_error "  kubectl logs -n crczp -l app.kubernetes.io/name=keycloak --tail=50"
+    return 1
 }
 
 # Main execution
