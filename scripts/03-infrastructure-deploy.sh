@@ -292,6 +292,65 @@ cleanup_failed_helm_releases() {
     log_success "Helm cleanup done"
 }
 
+# Extend Helm release timeouts inside downloaded Terraform modules.
+# The KYPO stack often needs much longer than the provider defaults on
+# nested-virtualization deployments such as this Vagrant + OpenStack setup.
+patch_helm_timeouts() {
+    log "Patching Helm release timeouts in Terraform modules..."
+
+    local head_tf monitoring_tf
+    head_tf=".terraform/modules/helm/helm_app.tf"
+    monitoring_tf=".terraform/modules/monitoring/prometheus.tf"
+
+    if [ -f "$head_tf" ] && ! grep -q 'timeout *= *3600' "$head_tf"; then
+        if python3 - "$head_tf" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+pattern = r'(resource "helm_release" "head" \{.*?create_namespace\s*=\s*true\n)'
+replacement = r'\1  timeout                    = 3600\n'
+updated = re.sub(pattern, replacement, text, count=1, flags=re.S)
+if updated != text:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(updated)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+        then
+            log "Patched head Helm timeout to 3600s"
+        else
+            log_warning "Could not patch head Helm timeout automatically"
+        fi
+    fi
+
+    if [ -f "$monitoring_tf" ] && ! grep -q 'timeout *= *1800' "$monitoring_tf"; then
+        if python3 - "$monitoring_tf" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+pattern = r'(resource "helm_release" "prometheus_stack" \{.*?create_namespace\s*=\s*false\n)'
+replacement = r'\1  timeout                    = 1800\n'
+updated = re.sub(pattern, replacement, text, count=1, flags=re.S)
+if updated != text:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(updated)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+        then
+            log "Patched prometheus Helm timeout to 1800s"
+        else
+            log_warning "Could not patch prometheus Helm timeout automatically"
+        fi
+    fi
+
+    log_success "Helm timeout patching completed"
+}
+
 # Wait for Helm/Kubernetes dependencies before deploying head
 wait_for_head_dependencies() {
     log "Waiting for head service dependencies to be ready..."
@@ -334,6 +393,26 @@ wait_for_head_dependencies() {
     sleep 30
 
     log_success "Dependency wait completed"
+}
+
+dump_helm_diagnostics() {
+    local release="$1"
+    local namespace="$2"
+
+    log_warning "Collecting diagnostics for release '$release' in namespace '$namespace'..."
+
+    helm status "$release" -n "$namespace" 2>/dev/null || true
+    kubectl get pods -n "$namespace" -o wide 2>/dev/null || true
+    kubectl get events -n "$namespace" --sort-by=.lastTimestamp 2>/dev/null | tail -30 || true
+
+    case "$release" in
+        head)
+            kubectl logs -n "$namespace" job/head-hook-preinstall --tail=100 2>/dev/null || true
+            ;;
+        prometheus)
+            kubectl get pods -n "$namespace" 2>/dev/null | grep -i prometheus || true
+            ;;
+    esac
 }
 
 # Deploy head services
@@ -420,6 +499,8 @@ EOF
         retry tofu init -upgrade
     fi
 
+    patch_helm_timeouts
+
     # Wait for dependencies before applying
     cleanup_failed_helm_releases
     wait_for_head_dependencies
@@ -466,15 +547,21 @@ EOF
     local max_attempts=3
     local attempt=1
     while [ $attempt -le $max_attempts ]; do
+        log "Starting tofu apply attempt $attempt/$max_attempts..."
+        wait_for_head_dependencies
+
         if tofu apply -auto-approve; then
             log_success "Head services deployment completed"
             return 0
         fi
         log_warning "tofu apply attempt $attempt/$max_attempts failed"
+        dump_helm_diagnostics "head" "crczp"
+        dump_helm_diagnostics "prometheus" "prometheus"
         if [ $attempt -lt $max_attempts ]; then
             log "Cleaning up stuck Helm releases before retry..."
             cleanup_failed_helm_releases
-            sleep 15
+            log "Waiting 60s before retry so controllers/webhooks can settle..."
+            sleep 60
         fi
         ((attempt++))
     done
