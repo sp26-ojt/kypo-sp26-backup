@@ -14,6 +14,7 @@ log "Starting OpenStack deployment..."
 VENV_PATH="/root/kolla-ansible-venv"
 KOLLA_CONFIG_DIR="/etc/kolla"
 ANSIBLE_CONFIG_DIR="/etc/ansible"
+OPENSTACK_INIT_MARKER="/root/.kypo-openstack-init.done"
 
 # Setup Python virtual environment
 setup_python_environment() {
@@ -216,8 +217,14 @@ wait_for_openstack_stable() {
     source "$VENV_PATH/bin/activate"
     source /etc/kolla/admin-openrc.sh
 
-    wait_for_service "OpenStack endpoint API" "openstack endpoint list" 60 10 || return 1
-    wait_for_service "Glance service catalog" "openstack service list | grep -qi image" 30 10 || return 1
+    wait_for_service "OpenStack endpoint API" "openstack endpoint list" 120 10 || {
+        dump_openstack_diagnostics
+        return 1
+    }
+    wait_for_service "Glance service catalog" "openstack service list | grep -qi image" 60 10 || {
+        dump_openstack_diagnostics
+        return 1
+    }
 
     log "Sleeping 30s to let API workers settle..."
     sleep 30
@@ -258,13 +265,23 @@ initialize_openstack() {
 
     source /etc/kolla/admin-openrc.sh
 
+    if [ -f "$OPENSTACK_INIT_MARKER" ]; then
+        log "Initialization marker exists, checking whether OpenStack API is already back..."
+    fi
+
     wait_for_openstack_stable || {
+        if [ -f "$OPENSTACK_INIT_MARKER" ]; then
+            log_warning "OpenStack was initialized previously but API is still not stable"
+            log_warning "Skipping init-runonce and continuing with existing deployment state"
+            return 0
+        fi
         log_error "OpenStack API did not become stable before initialization"
         return 1
     }
 
     if openstack_bootstrap_already_done; then
         log "OpenStack bootstrap resources already exist, skipping init-runonce"
+        touch "$OPENSTACK_INIT_MARKER"
         return 0
     fi
 
@@ -286,6 +303,7 @@ initialize_openstack() {
     fi
 
     log_success "OpenStack initialization completed"
+    touch "$OPENSTACK_INIT_MARKER"
 }
 
 # Configure additional networking
