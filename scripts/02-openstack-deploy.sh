@@ -179,6 +179,45 @@ setup_openstack_client() {
     log_success "OpenStack client setup completed"
 }
 
+wait_for_openstack_stable() {
+    log "Waiting for OpenStack API and core services to stabilize..."
+
+    source "$VENV_PATH/bin/activate"
+    source /etc/kolla/admin-openrc.sh
+
+    wait_for_service "OpenStack endpoint API" "openstack endpoint list" 60 10 || return 1
+    wait_for_service "Glance service catalog" "openstack service list | grep -qi image" 30 10 || return 1
+
+    log "Sleeping 30s to let API workers settle..."
+    sleep 30
+
+    log_success "OpenStack services look stable"
+}
+
+openstack_bootstrap_already_done() {
+    source "$VENV_PATH/bin/activate"
+    source /etc/kolla/admin-openrc.sh
+
+    openstack image show cirros >/dev/null 2>&1 && \
+    openstack network show demo-net >/dev/null 2>&1 && \
+    openstack flavor show m1.tiny >/dev/null 2>&1
+}
+
+dump_openstack_diagnostics() {
+    log_warning "Collecting OpenStack diagnostics..."
+
+    source "$VENV_PATH/bin/activate"
+    source /etc/kolla/admin-openrc.sh
+
+    openstack endpoint list 2>/dev/null || true
+    openstack service list 2>/dev/null || true
+    openstack image list 2>/dev/null || true
+
+    docker ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null | grep -E 'keystone|glance|haproxy|mariadb' || true
+    docker logs --tail 80 glance_api 2>/dev/null || true
+    docker logs --tail 80 keystone 2>/dev/null || true
+}
+
 # Initialize OpenStack
 initialize_openstack() {
     log "Initializing OpenStack..."
@@ -188,6 +227,16 @@ initialize_openstack() {
 
     source /etc/kolla/admin-openrc.sh
 
+    wait_for_openstack_stable || {
+        log_error "OpenStack API did not become stable before initialization"
+        return 1
+    }
+
+    if openstack_bootstrap_already_done; then
+        log "OpenStack bootstrap resources already exist, skipping init-runonce"
+        return 0
+    fi
+
     # Update init-runonce script for correct network
     local init_script="$VENV_PATH/share/kolla-ansible/init-runonce"
     if [ -f "$init_script" ]; then
@@ -195,7 +244,11 @@ initialize_openstack() {
 
         # Run initialization
         log "Running OpenStack initialization script..."
-        bash "$init_script"
+        if ! retry bash "$init_script"; then
+            dump_openstack_diagnostics
+            log_error "OpenStack initialization script failed"
+            return 1
+        fi
     else
         log_error "init-runonce script not found"
         return 1
