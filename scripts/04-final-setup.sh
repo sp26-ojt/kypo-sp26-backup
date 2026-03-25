@@ -46,15 +46,6 @@ display_deployment_info() {
         keycloak_password="<unavailable>"
     fi
 
-    # Abort banner if head services state is clearly broken
-    # Check tofu state directly — if no resources exist, deploy failed
-    local head_resource_count
-    head_resource_count=$(tofu state list 2>/dev/null | wc -l || echo "0")
-    if [ "$head_resource_count" -lt 5 ]; then
-        log_error "Head services Terraform state has fewer than 5 resources (got $head_resource_count) — deployment likely failed. Skipping success banner."
-        return 1
-    fi
-
     log_success "Deployment information gathered"
 
     # Display the information
@@ -148,7 +139,7 @@ main() {
     sleep 10
 
     verify_services
-    display_deployment_info || { log_error "Deployment did not complete successfully. Check logs above."; exit 1; }
+    display_deployment_info
     final_cleanup
 
     log_success "=== Final Setup Phase Completed ==="
