@@ -14,18 +14,17 @@ log "Starting OpenStack deployment..."
 VENV_PATH="/root/kolla-ansible-venv"
 KOLLA_CONFIG_DIR="/etc/kolla"
 ANSIBLE_CONFIG_DIR="/etc/ansible"
-OPENSTACK_INIT_MARKER="/root/.kypo-openstack-init.done"
 
 # Setup Python virtual environment
 setup_python_environment() {
     log "Setting up Python virtual environment for Kolla-Ansible..."
 
-    if [ -x "$VENV_PATH/bin/python3" ]; then
-        log "Virtual environment already exists, reusing it"
-    else
-        python3 -m venv "$VENV_PATH" --system-site-packages
+    if [ -d "$VENV_PATH" ]; then
+        log_warning "Virtual environment already exists, removing..."
+        rm -rf "$VENV_PATH"
     fi
 
+    python3 -m venv "$VENV_PATH" --system-site-packages
     source "$VENV_PATH/bin/activate"
 
     # Upgrade pip
@@ -125,25 +124,6 @@ configure_globals() {
     log_success "Globals configuration completed"
 }
 
-openstack_api_ready() {
-    source "$VENV_PATH/bin/activate"
-
-    if [ ! -f /etc/kolla/admin-openrc.sh ]; then
-        return 1
-    fi
-
-    source /etc/kolla/admin-openrc.sh
-    openstack endpoint list >/dev/null 2>&1
-}
-
-dump_kolla_deploy_diagnostics() {
-    log_warning "Collecting Kolla deployment diagnostics..."
-
-    docker ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null | grep -E 'mariadb|keystone|glance|haproxy' || true
-    docker logs --tail 80 mariadb 2>/dev/null || true
-    docker logs --tail 80 keystone 2>/dev/null || true
-}
-
 # Deploy OpenStack
 deploy_openstack() {
     log "Starting OpenStack deployment with Kolla-Ansible..."
@@ -151,22 +131,13 @@ deploy_openstack() {
     # Ensure we're in the virtual environment
     source "$VENV_PATH/bin/activate"
 
-    if openstack_api_ready; then
-        log "OpenStack API already responds, skipping Kolla redeploy"
-        return 0
-    fi
-
     # Install dependencies
     log "Installing Kolla dependencies..."
     retry kolla-ansible install-deps
 
     # Generate passwords
-    if [ -f "$KOLLA_CONFIG_DIR/passwords.yml" ]; then
-        log "Existing Kolla passwords detected, preserving passwords.yml"
-    else
-        log "Generating Kolla passwords..."
-        kolla-genpwd
-    fi
+    log "Generating Kolla passwords..."
+    kolla-genpwd
 
     # Bootstrap servers
     log "Bootstrapping servers..."
@@ -182,10 +153,7 @@ deploy_openstack() {
     log "Deploying OpenStack (this may take 30-60 minutes)..."
     if ! kolla-ansible deploy -i /root/all-in-one; then
         log_warning "First deployment attempt failed, retrying..."
-        if ! retry kolla-ansible deploy -i /root/all-in-one; then
-            dump_kolla_deploy_diagnostics
-            return 1
-        fi
+        retry kolla-ansible deploy -i /root/all-in-one
     fi
 
     # Post-deployment configuration
@@ -211,51 +179,6 @@ setup_openstack_client() {
     log_success "OpenStack client setup completed"
 }
 
-wait_for_openstack_stable() {
-    log "Waiting for OpenStack API and core services to stabilize..."
-
-    source "$VENV_PATH/bin/activate"
-    source /etc/kolla/admin-openrc.sh
-
-    wait_for_service "OpenStack endpoint API" "openstack endpoint list" 120 10 || {
-        dump_openstack_diagnostics
-        return 1
-    }
-    wait_for_service "Glance service catalog" "openstack service list | grep -qi image" 60 10 || {
-        dump_openstack_diagnostics
-        return 1
-    }
-
-    log "Sleeping 30s to let API workers settle..."
-    sleep 30
-
-    log_success "OpenStack services look stable"
-}
-
-openstack_bootstrap_already_done() {
-    source "$VENV_PATH/bin/activate"
-    source /etc/kolla/admin-openrc.sh
-
-    openstack image show cirros >/dev/null 2>&1 && \
-    openstack network show demo-net >/dev/null 2>&1 && \
-    openstack flavor show m1.tiny >/dev/null 2>&1
-}
-
-dump_openstack_diagnostics() {
-    log_warning "Collecting OpenStack diagnostics..."
-
-    source "$VENV_PATH/bin/activate"
-    source /etc/kolla/admin-openrc.sh
-
-    openstack endpoint list 2>/dev/null || true
-    openstack service list 2>/dev/null || true
-    openstack image list 2>/dev/null || true
-
-    docker ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null | grep -E 'keystone|glance|haproxy|mariadb' || true
-    docker logs --tail 80 glance_api 2>/dev/null || true
-    docker logs --tail 80 keystone 2>/dev/null || true
-}
-
 # Initialize OpenStack
 initialize_openstack() {
     log "Initializing OpenStack..."
@@ -265,26 +188,6 @@ initialize_openstack() {
 
     source /etc/kolla/admin-openrc.sh
 
-    if [ -f "$OPENSTACK_INIT_MARKER" ]; then
-        log "Initialization marker exists, checking whether OpenStack API is already back..."
-    fi
-
-    wait_for_openstack_stable || {
-        if [ -f "$OPENSTACK_INIT_MARKER" ]; then
-            log_warning "OpenStack was initialized previously but API is still not stable"
-            log_warning "Skipping init-runonce and continuing with existing deployment state"
-            return 0
-        fi
-        log_error "OpenStack API did not become stable before initialization"
-        return 1
-    }
-
-    if openstack_bootstrap_already_done; then
-        log "OpenStack bootstrap resources already exist, skipping init-runonce"
-        touch "$OPENSTACK_INIT_MARKER"
-        return 0
-    fi
-
     # Update init-runonce script for correct network
     local init_script="$VENV_PATH/share/kolla-ansible/init-runonce"
     if [ -f "$init_script" ]; then
@@ -292,18 +195,13 @@ initialize_openstack() {
 
         # Run initialization
         log "Running OpenStack initialization script..."
-        if ! retry bash "$init_script"; then
-            dump_openstack_diagnostics
-            log_error "OpenStack initialization script failed"
-            return 1
-        fi
+        bash "$init_script"
     else
         log_error "init-runonce script not found"
         return 1
     fi
 
     log_success "OpenStack initialization completed"
-    touch "$OPENSTACK_INIT_MARKER"
 }
 
 # Configure additional networking
