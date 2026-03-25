@@ -137,21 +137,22 @@ deploy_base_infrastructure() {
 
     # Check current state
     log "Checking current infrastructure state..."
-    tofu plan -var-file tfvars/vars-all.tfvars -detailed-exitcode >/dev/null 2>&1
-    plan_exit=$?
-    case $plan_exit in
-        0)
-            log "Infrastructure is up to date, no changes needed"
-            return 0
-            ;;
-        1)
-            log_error "Terraform plan failed"
-            return 1
-            ;;
-        2)
-            log "Changes detected, applying infrastructure updates..."
-            ;;
-    esac
+    if tofu plan -var-file tfvars/vars-all.tfvars -detailed-exitcode >/dev/null 2>&1; then
+        exit_code=$?
+        case $exit_code in
+            0)
+                log "Infrastructure is up to date, no changes needed"
+                return 0
+                ;;
+            1)
+                log_error "Terraform plan failed"
+                return 1
+                ;;
+            2)
+                log "Changes detected, applying infrastructure updates..."
+                ;;
+        esac
+    fi
 
     # Apply Terraform configuration
     log "Applying base infrastructure (this may take 15-30 minutes)..."
@@ -268,153 +269,6 @@ setup_head_services_variables() {
     log_success "Head services variables setup completed"
 }
 
-# Clean up stuck/failed Helm releases so tofu apply can retry cleanly
-cleanup_failed_helm_releases() {
-    log "Checking for stuck Helm releases across all namespaces..."
-
-    # Get all releases in any non-deployed state
-    local stuck
-    stuck=$(helm list -A -o json 2>/dev/null \
-        | jq -r '.[] | select(.status != "deployed") | "\(.namespace) \(.name)"' 2>/dev/null || true)
-
-    if [ -z "$stuck" ]; then
-        log "No stuck Helm releases found"
-        return 0
-    fi
-
-    while IFS=' ' read -r ns release; do
-        [ -z "$release" ] && continue
-        log_warning "Uninstalling stuck release '$release' in namespace '$ns' ..."
-        helm uninstall "$release" -n "$ns" --wait --timeout 120s 2>/dev/null || \
-            helm uninstall "$release" -n "$ns" --no-hooks 2>/dev/null || true
-    done <<< "$stuck"
-
-    log_success "Helm cleanup done"
-}
-
-# Extend Helm release timeouts inside downloaded Terraform modules.
-# The KYPO stack often needs much longer than the provider defaults on
-# nested-virtualization deployments such as this Vagrant + OpenStack setup.
-patch_helm_timeouts() {
-    log "Patching Helm release timeouts in Terraform modules..."
-
-    local head_tf monitoring_tf
-    head_tf=".terraform/modules/helm/helm_app.tf"
-    monitoring_tf=".terraform/modules/monitoring/prometheus.tf"
-
-    if [ -f "$head_tf" ] && ! grep -q 'timeout *= *3600' "$head_tf"; then
-        if python3 - "$head_tf" <<'PY'
-import re
-import sys
-
-path = sys.argv[1]
-text = open(path, encoding="utf-8").read()
-pattern = r'(resource "helm_release" "head" \{.*?create_namespace\s*=\s*true\n)'
-replacement = r'\1  timeout                    = 3600\n'
-updated = re.sub(pattern, replacement, text, count=1, flags=re.S)
-if updated != text:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(updated)
-    raise SystemExit(0)
-raise SystemExit(1)
-PY
-        then
-            log "Patched head Helm timeout to 3600s"
-        else
-            log_warning "Could not patch head Helm timeout automatically"
-        fi
-    fi
-
-    if [ -f "$monitoring_tf" ] && ! grep -q 'timeout *= *1800' "$monitoring_tf"; then
-        if python3 - "$monitoring_tf" <<'PY'
-import re
-import sys
-
-path = sys.argv[1]
-text = open(path, encoding="utf-8").read()
-pattern = r'(resource "helm_release" "prometheus_stack" \{.*?create_namespace\s*=\s*false\n)'
-replacement = r'\1  timeout                    = 1800\n'
-updated = re.sub(pattern, replacement, text, count=1, flags=re.S)
-if updated != text:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(updated)
-    raise SystemExit(0)
-raise SystemExit(1)
-PY
-        then
-            log "Patched prometheus Helm timeout to 1800s"
-        else
-            log_warning "Could not patch prometheus Helm timeout automatically"
-        fi
-    fi
-
-    log_success "Helm timeout patching completed"
-}
-
-# Wait for Helm/Kubernetes dependencies before deploying head
-wait_for_head_dependencies() {
-    log "Waiting for head service dependencies to be ready..."
-
-    # cert-manager
-    log "Waiting for cert-manager..."
-    if ! kubectl wait deployment/cert-manager \
-            -n cert-manager --for=condition=Available \
-            --timeout=300s 2>/dev/null; then
-        log_warning "cert-manager not found or not ready, continuing..."
-    else
-        kubectl wait deployment/cert-manager-webhook \
-            -n cert-manager --for=condition=Available \
-            --timeout=120s 2>/dev/null || true
-        log_success "cert-manager ready"
-    fi
-
-    # keycloak-operator
-    log "Waiting for keycloak-operator..."
-    if ! kubectl wait deployment/keycloak-operator \
-            -n keycloak-operator --for=condition=Available \
-            --timeout=300s 2>/dev/null; then
-        log_warning "keycloak-operator not found or not ready, continuing..."
-    else
-        log_success "keycloak-operator ready"
-    fi
-
-    # cnpg / postgres operator
-    log "Waiting for cnpg controller..."
-    if ! kubectl wait deployment/cnpg-controller-manager \
-            -n cnpg-system --for=condition=Available \
-            --timeout=300s 2>/dev/null; then
-        log_warning "cnpg-controller-manager not found or not ready, continuing..."
-    else
-        log_success "cnpg controller ready"
-    fi
-
-    # Extra buffer so webhooks/CRDs are fully registered
-    log "Sleeping 30s for webhook/CRD registration..."
-    sleep 30
-
-    log_success "Dependency wait completed"
-}
-
-dump_helm_diagnostics() {
-    local release="$1"
-    local namespace="$2"
-
-    log_warning "Collecting diagnostics for release '$release' in namespace '$namespace'..."
-
-    helm status "$release" -n "$namespace" 2>/dev/null || true
-    kubectl get pods -n "$namespace" -o wide 2>/dev/null || true
-    kubectl get events -n "$namespace" --sort-by=.lastTimestamp 2>/dev/null | tail -30 || true
-
-    case "$release" in
-        head)
-            kubectl logs -n "$namespace" job/head-hook-preinstall --tail=100 2>/dev/null || true
-            ;;
-        prometheus)
-            kubectl get pods -n "$namespace" 2>/dev/null | grep -i prometheus || true
-            ;;
-    esac
-}
-
 # Deploy head services
 deploy_head_services() {
     log "Deploying head services..."
@@ -499,79 +353,33 @@ EOF
         retry tofu init -upgrade
     fi
 
-    patch_helm_timeouts
-
-    # Wait for dependencies before applying
-    cleanup_failed_helm_releases
-    wait_for_head_dependencies
-
-    # Also remove any helm_release resources from tofu state that correspond
-    # to stuck Helm releases, so tofu treats them as fresh installs
-    log "Syncing Terraform state with actual Helm state..."
-    local helm_state_resources
-    helm_state_resources=$(tofu state list 2>/dev/null | grep 'helm_release' || true)
-    if [ -n "$helm_state_resources" ]; then
-        while IFS= read -r res; do
-            local rel_name
-            rel_name=$(echo "$res" | sed 's/.*\.//')
-            local status
-            status=$(helm list -A -o json 2>/dev/null \
-                | jq -r --arg n "$rel_name" '.[] | select(.name == $n) | .status' 2>/dev/null | head -1)
-            if [ -z "$status" ] || [ "$status" != "deployed" ]; then
-                log_warning "State rm: $res (helm status: '${status:-not found}')"
-                tofu state rm "$res" 2>/dev/null || true
-            fi
-        done <<< "$helm_state_resources"
-    fi
-
     # Check current state before applying
     log "Checking current head services state..."
-    tofu plan -detailed-exitcode >/dev/null 2>&1
-    plan_exit=$?
-    case $plan_exit in
-        0)
-            log "Head services are up to date, no changes needed"
-            return 0
-            ;;
-        1)
-            log_error "Terraform plan failed"
-            return 1
-            ;;
-        2)
-            log "Changes detected, applying head services updates..."
-            ;;
-    esac
+    if tofu plan -detailed-exitcode >/dev/null 2>&1; then
+        exit_code=$?
+        case $exit_code in
+            0)
+                log "Head services are up to date, no changes needed"
+                return 0
+                ;;
+            1)
+                log_error "Terraform plan failed"
+                return 1
+                ;;
+            2)
+                log "Changes detected, applying head services updates..."
+                ;;
+        esac
+    fi
 
-    # Apply with retry — cleanup stuck Helm releases between attempts
+    # Apply head services configuration
     log "Applying head services configuration (this may take 20-40 minutes)..."
-    local max_attempts=3
-    local attempt=1
-    while [ $attempt -le $max_attempts ]; do
-        log "Starting tofu apply attempt $attempt/$max_attempts..."
-        wait_for_head_dependencies
+    if ! retry tofu apply -auto-approve; then
+        log_error "Head services deployment failed"
+        return 1
+    fi
 
-        if tofu apply -auto-approve; then
-            log_success "Head services deployment completed"
-            return 0
-        fi
-        log_warning "tofu apply attempt $attempt/$max_attempts failed"
-        dump_helm_diagnostics "head" "crczp"
-        dump_helm_diagnostics "prometheus" "prometheus"
-        if [ $attempt -lt $max_attempts ]; then
-            log "Cleaning up stuck Helm releases before retry..."
-            cleanup_failed_helm_releases
-            log "Waiting 60s before retry so controllers/webhooks can settle..."
-            sleep 60
-        fi
-        ((attempt++))
-    done
-
-    log_error "Head services deployment failed after $max_attempts attempts"
-    log_error "Run the following to diagnose:"
-    log_error "  kubectl get pods -n crczp"
-    log_error "  kubectl get events -n crczp --sort-by=.lastTimestamp | tail -30"
-    log_error "  kubectl logs -n crczp -l app.kubernetes.io/name=keycloak --tail=50"
-    return 1
+    log_success "Head services deployment completed"
 }
 
 # Main execution
@@ -584,13 +392,13 @@ main() {
     fi
 
     # Execute deployment steps
-    setup_application_credentials || { log_error "setup_application_credentials failed"; exit 1; }
-    setup_git_repository || { log_error "setup_git_repository failed"; exit 1; }
-    deploy_base_infrastructure || { log_error "deploy_base_infrastructure failed"; exit 1; }
-    setup_kubernetes_config || { log_error "setup_kubernetes_config failed"; exit 1; }
-    wait_for_kubernetes || { log_error "wait_for_kubernetes failed"; exit 1; }
-    setup_head_services_variables || { log_error "setup_head_services_variables failed"; exit 1; }
-    deploy_head_services || { log_error "deploy_head_services failed"; exit 1; }
+    setup_application_credentials
+    setup_git_repository
+    deploy_base_infrastructure
+    setup_kubernetes_config
+    wait_for_kubernetes
+    setup_head_services_variables
+    deploy_head_services
 
     log_success "=== Infrastructure Deployment Phase Completed ==="
 }
